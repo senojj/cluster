@@ -15,50 +15,77 @@ import (
 	"github.com/hashicorp/memberlist"
 )
 
+// MODEL
 /*
-type user
+	type user
 
-type group
-	relations
-		define parent: [group]
-		define member: [user] or member from parent
+	type group
+		relations
+			define parent: [group]
+			define member: [user] or member from parent
 
-type document
-	relations
-		define viewer: [user, group#member]
+	type document
+		relations
+			define viewer: [user, group#member]
 */
 
+// TUPLES
 /*
-1. DISPATCH - document:1#viewer@user:1
-2a. QUERY - select 1
-			from tuples
-			where object_type = 'document'
-			and object_id = '1'
-			and relation = 'viewer'
-			and subject_type = 'user'
-			and subject_id = '1';
-2b. QUERY - select object_id
-			from tuples
-			where object_type = 'group'
-			and relation = 'member'
-			and subject_type = 'user'
-			and subject_id = '1';
-3. DISPATCH - document:1#viewer@group:1#member
-4a. QUERY - select 1
-			from tuples
-			where object_type = 'document'
-			and object_id = '1'
-			and relation = 'viewer'
-			and subject_type = 'group'
-			and subject_id = '1'
-			and subject_relation = 'member';
-4b. QUERY - select object_id
-			from tuples
-			where object_type = 'group'
-			and relation = 'parent'
-			and subject_type = 'group'
-			and subject_id = '1';
-5. DISPATCH - document:1#viewer@group:2#member
+	group:1#member@user:1
+	group:2#parent@group:1
+	group:3#parent@group:1
+	document:1#viewer@group:2
+*/
+
+// RESOLUTION SEQUENCE
+/*
+	1. DISPATCH - document:1#viewer@user:1
+	1a. QUERY - select 1
+				from tuples
+				where object_type = 'document'
+				and object_id = '1'
+				and relation = 'viewer'
+				and subject_type = 'user'
+				and subject_id = '1';
+	1b. QUERY - select object_id
+				from tuples
+				where object_type = 'group'
+				and relation = 'member'
+				and subject_type = 'user'
+				and subject_id = '1';
+	2. DISPATCH - document:1#viewer@group:1#member
+	2a. QUERY - select 1
+				from tuples
+				where object_type = 'document'
+				and object_id = '1'
+				and relation = 'viewer'
+				and subject_type = 'group'
+				and subject_id = '1'
+				and subject_relation = 'member';
+	2b. QUERY - select object_id
+				from tuples
+				where object_type = 'group'
+				and relation = 'parent'
+				and subject_type = 'group'
+				and subject_id = '1';
+	3. DISPATCH - document:1#viewer@group:2#member
+	3a. QUERY - select 1
+				from tuples
+				where object_type = 'document'
+				and object_id = '1'
+				and relation = 'viewer'
+				and subject_type = 'group'
+				and subject_id = '2'
+				and subject_relation = 'member';
+	4. DISPATCH - document:1#viewer@group:3#member
+	4a. QUERY - select 1
+				from tuples
+				where object_type = 'document'
+				and object_id = '1'
+				and relation = 'viewer'
+				and subject_type = 'group'
+				and subject_id = '3'
+				and subject_relation = 'member';
 */
 
 type LoggingTransport struct {
