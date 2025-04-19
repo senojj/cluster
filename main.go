@@ -13,6 +13,7 @@ import (
 
 	"github.com/golang/groupcache"
 	"github.com/hashicorp/memberlist"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // MODEL
@@ -40,21 +41,36 @@ import (
 // RESOLUTION SEQUENCE
 /*
 	1. DISPATCH - document:1#viewer@user:1
-	1a. QUERY - select 1
+	1a. QUERY - select object_type,
+					   object_id,
+					   relation,
+					   subject_type,
+					   subject_id,
+					   subject_relation
 				from tuples
 				where object_type = 'document'
 				and object_id = '1'
 				and relation = 'viewer'
 				and subject_type = 'user'
 				and subject_id = '1';
-	1b. QUERY - select object_id
+	1b. QUERY - select object_type,
+					   object_id,
+					   relation,
+					   subject_type,
+					   subject_id,
+					   subject_relation
 				from tuples
 				where object_type = 'group'
 				and relation = 'member'
 				and subject_type = 'user'
 				and subject_id = '1';
 	2. DISPATCH - document:1#viewer@group:1#member
-	2a. QUERY - select 1
+	2a. QUERY - select object_type,
+					   object_id,
+					   relation,
+					   subject_type,
+					   subject_id,
+					   subject_relation
 				from tuples
 				where object_type = 'document'
 				and object_id = '1'
@@ -62,14 +78,24 @@ import (
 				and subject_type = 'group'
 				and subject_id = '1'
 				and subject_relation = 'member';
-	2b. QUERY - select object_id
+	2b. QUERY - select object_type,
+					   object_id,
+					   relation,
+					   subject_type,
+					   subject_id,
+					   subject_relation
 				from tuples
 				where object_type = 'group'
 				and relation = 'parent'
 				and subject_type = 'group'
 				and subject_id = '1';
 	3. DISPATCH - document:1#viewer@group:2#member
-	3a. QUERY - select 1
+	3a. QUERY - select object_type,
+					   object_id,
+					   relation,
+					   subject_type,
+					   subject_id,
+					   subject_relation
 				from tuples
 				where object_type = 'document'
 				and object_id = '1'
@@ -78,7 +104,12 @@ import (
 				and subject_id = '2'
 				and subject_relation = 'member';
 	4. DISPATCH - document:1#viewer@group:3#member
-	4a. QUERY - select 1
+	4a. QUERY - select object_type,
+					   object_id,
+					   relation,
+					   subject_type,
+					   subject_id,
+					   subject_relation
 				from tuples
 				where object_type = 'document'
 				and object_id = '1'
@@ -226,8 +257,14 @@ func main() {
 
 	pool.Set(friends.List()...)
 
+	cpool, err := pgxpool.New(context.Background(), "posgres://127.0.0.1:5432/postgres")
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	group := groupcache.NewGroup("xyz", 64<<20, groupcache.GetterFunc(
 		func(ctx context.Context, key string, dest groupcache.Sink) error {
+
 			dest.SetString(prtCache)
 			return nil
 		},
