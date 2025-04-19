@@ -34,7 +34,7 @@ import (
 	group:1#member@user:1
 	group:2#parent@group:1
 	group:3#parent@group:1
-	document:1#viewer@group:2
+	document:1#viewer@group:2#member
 */
 
 // RESOLUTION SEQUENCE
