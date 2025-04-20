@@ -1,7 +1,9 @@
 package main
 
 import (
+	"cluster/pkg/graph"
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -264,8 +266,28 @@ func main() {
 
 	group := groupcache.NewGroup("xyz", 64<<20, groupcache.GetterFunc(
 		func(ctx context.Context, key string, dest groupcache.Sink) error {
+			scheduler := graph.NewScheduler(ctx, 5)
+			group := groupcache.GetGroup("xyz")
+			if group == nil {
+				return errors.New("no such group")
+			}
 
-			dest.SetString(prtCache)
+			resolver := graph.Resolver{
+				ConnectionPool: cpool,
+				Group:          groupcache.GetGroup("xyz"),
+				Scheduler:      scheduler,
+			}
+
+			allowed, err := resolver.Resolve(ctx, key)
+			if err != nil {
+				return err
+			}
+
+			if allowed {
+				dest.SetString("true")
+			} else {
+				dest.SetString("false")
+			}
 			return nil
 		},
 	))

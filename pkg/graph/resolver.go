@@ -1,14 +1,11 @@
 package graph
 
 import (
-	"bytes"
 	"context"
-	"encoding/gob"
 	"errors"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/golang/groupcache"
@@ -17,30 +14,32 @@ import (
 
 var TupleRegex = regexp.MustCompile(`([a-z0-9]+):([a-z0-9]+)#([a-z0-9]+)@([a-z0-9]+):([a-z0-9]+)(#([a-z0-9]+))?`)
 
-const QryDocumentViewerUser = `select object_type,
-									  object_id,
-									  relation,
-									  subject_type,
-									  subject_id,
-									  subject_relation
-								from tuples
-								where object_type = 'document'
-								and object_id = $
-								and relation = 'viewer'
-								and subject_type = 'user'
-								and subject_id = $;`
+const QryDirect = `select object_type,
+						  object_id,
+						  relation,
+						  subject_type,
+						  subject_id,
+						  subject_relation
+					from tuples
+					where object_type = $
+					and object_id = $
+					and relation = $
+					and subject_type = $
+					and subject_id = $
+					and subject_relation = $;`
 
-const QryGroupMemberUser = `select object_type,
-								   object_id,
-								   relation,
-								   subject_type,
-								   subject_id,
-								   subject_relation
-							from tuples
-							where object_type = 'group'
-							and relation = 'member'
-							and subject_type = 'user'
-							and subject_id = $;`
+const QryUserObjects = `select object_type,
+							   object_id,
+							   relation,
+							   subject_type,
+							   subject_id,
+							   subject_relation
+						from tuples
+						where object_type = $
+						and relation = $
+						and subject_type = $
+						and subject_id = $
+						and subject_relation = $;`
 
 type Tuple struct {
 	ObjectType      string
@@ -49,6 +48,20 @@ type Tuple struct {
 	SubjectType     string
 	SubjectId       string
 	SubjectRelation string
+}
+
+type TuplePart struct {
+	Type     string
+	Id       string
+	Relation string
+}
+
+func (t Tuple) Subject() TuplePart {
+	return TuplePart{
+		Type:     t.SubjectType,
+		Id:       t.SubjectId,
+		Relation: t.SubjectRelation,
+	}
 }
 
 func (t Tuple) String() string {
@@ -87,24 +100,76 @@ func Key(tu Tuple, ti time.Time) string {
 	return tu.String() + "|" + Timestamp(ti)
 }
 
-type Result struct {
-	Outcome bool
-	Err     error
-}
-
 type Resolver struct {
 	ConnectionPool *pgxpool.Pool
 	Group          *groupcache.Group
+	Scheduler      *Scheduler
+}
+
+func Direct(ctx context.Context, conn *pgxpool.Conn, tu Tuple) (bool, error) {
+	rows, err := conn.Query(
+		ctx,
+		QryDirect,
+		tu.ObjectType,
+		tu.ObjectId,
+		tu.Relation,
+		tu.SubjectType,
+		tu.SubjectId,
+		tu.SubjectRelation,
+	)
+	if err != nil {
+		return false, err
+	}
+	var tuples []Tuple
+
+	for rows.Next() {
+		var tu Tuple
+		err := rows.Scan(&tu)
+		if err != nil {
+			return false, err
+		}
+		tuples = append(tuples, tu)
+	}
+
+	if len(tuples) > 0 {
+		return true, nil
+	}
+	return false, nil
+}
+
+func UserObjects(ctx context.Context, conn *pgxpool.Conn, obj string, sub TuplePart) ([]Tuple, error) {
+	rows, err := conn.Query(
+		ctx,
+		QryUserObjects,
+		obj,
+		sub.Type,
+		sub.Id,
+		sub.Relation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var tuples []Tuple
+
+	for rows.Next() {
+		var tu Tuple
+		err := rows.Scan(&tu)
+		if err != nil {
+			return nil, err
+		}
+		tuples = append(tuples, tu)
+	}
+	return tuples, nil
 }
 
 func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
 
 	defer func() {
 		cancel()
-		wg.Wait()
 	}()
+
+	chResult := make(chan Result, 1)
 
 	splits := strings.Split(key, "|")
 
@@ -128,74 +193,93 @@ func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 		switch tupleKey.SubjectType {
 		case "user":
 			if tupleKey.Relation == "viewer" {
-				rows, err := conn.Query(ctx, QryDocumentViewerUser, tupleKey.ObjectId, tupleKey.SubjectId)
-				if err != nil {
-					return false, err
-				}
-				var tuples []Tuple
+				ctx, cancel := context.WithCancel(ctx)
 
-				for rows.Next() {
-					var tu Tuple
-					err := rows.Scan(&tu)
+				r.Scheduler.Schedule(ctx, func(ctx context.Context) (bool, error) {
+					allowed, err := Direct(ctx, conn, tupleKey)
 					if err != nil {
+						cancel()
 						return false, err
 					}
-					tuples = append(tuples, tu)
-				}
 
-				if len(tuples) > 0 {
-					return true, nil
-				}
-
-				rows, err = conn.Query(ctx, QryGroupMemberUser, tupleKey.SubjectId)
-				if err != nil {
-					return false, err
-				}
-
-				for rows.Next() {
-					var tu Tuple
-					err := rows.Scan(&tu)
-					if err != nil {
-						return false, err
+					if allowed {
+						cancel()
+						return true, nil
 					}
-					tuples = append(tuples, tu)
-				}
+					return false, nil
+				})
 
-				ch := make(chan Result)
-
-				for _, tuple := range tuples {
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-
-						var dispatchKey Tuple
-						dispatchKey.ObjectType = tupleKey.ObjectType
-						dispatchKey.ObjectId = tupleKey.ObjectId
-						dispatchKey.Relation = tupleKey.Relation
-						dispatchKey.SubjectType = tuple.ObjectType
-						dispatchKey.SubjectId = tuple.ObjectId
-						dispatchKey.SubjectRelation = tuple.Relation
-
-						var dest Result
-						var buf []byte
-						err := group.Get(ctx, Key(dispatchKey, time.Now()), groupcache.AllocatingByteSliceSink(&buf))
-						if err != nil {
-							dest.Err = err
-							select {
-							case <-ctx.Done():
-							case ch <- dest:
-							}
-							return
-						}
-						dec := gob.NewDecoder(bytes.NewReader(buf))
-						dec.Decode(&dest)
-						select {
-						case <-ctx.Done():
-						case ch <- dest:
-						}
+				r.Scheduler.Schedule(ctx, func(ctx context.Context) (bool, error) {
+					chIn := make(chan Result, 1)
+					ctx, cancel := context.WithCancel(ctx)
+					defer func() {
+						cancel()
+						wgIn.Wait()
+						wg.Done()
 					}()
+					tuples, err := UserObjects(ctx, conn, "group", tupleKey.Subject())
+					if err != nil {
+						select {
+						case chResult <- Result[bool]{
+							Err: err,
+						}:
+						case <-ctx.Done():
+						}
+						return
+					}
+
+					for _, tuple := range tuples {
+						if ctx.Err() != nil {
+							break
+						}
+						wgIn.Add(1)
+						go func() {
+							defer wgIn.Done()
+
+							var dispatchKey Tuple
+							dispatchKey.ObjectType = tupleKey.ObjectType
+							dispatchKey.ObjectId = tupleKey.ObjectId
+							dispatchKey.Relation = tupleKey.Relation
+							dispatchKey.SubjectType = tuple.ObjectType
+							dispatchKey.SubjectId = tuple.ObjectId
+							dispatchKey.SubjectRelation = tuple.Relation
+
+							var dest string
+							err := group.Get(ctx, Key(dispatchKey, time.Now()), groupcache.StringSink(&dest))
+							if err != nil {
+								select {
+								case chIn <- Result[bool]{
+									Err: err,
+								}:
+								case <-ctx.Done():
+								}
+								return
+							}
+
+							if dest == "true" {
+								select {
+								case chIn <- Result[bool]{
+									Outcome: true,
+								}:
+								case <-ctx.Done():
+								}
+							}
+						}()
+					}
+					select {
+					case r := <-chIn:
+						chResult <- r
+					case <-ctx.Done():
+					}
+				})
+
+				select {
+				case r := <-chResult:
+					return r.Outcome, r.Err
+				case <-ctx.Done():
 				}
 			}
 		}
 	}
+	return false, nil
 }
