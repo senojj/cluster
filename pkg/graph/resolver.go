@@ -195,88 +195,44 @@ func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 			if tupleKey.Relation == "viewer" {
 				ctx, cancel := context.WithCancel(ctx)
 
-				r.Scheduler.Schedule(ctx, func(ctx context.Context) (bool, error) {
-					allowed, err := Direct(ctx, conn, tupleKey)
-					if err != nil {
-						cancel()
-						return false, err
-					}
-
-					if allowed {
-						cancel()
-						return true, nil
-					}
-					return false, nil
+				chDirect := r.Scheduler.Schedule(ctx, func(ctx context.Context) (any, error) {
+					return Direct(ctx, conn, tupleKey)
 				})
 
-				r.Scheduler.Schedule(ctx, func(ctx context.Context) (bool, error) {
-					chIn := make(chan Result, 1)
-					ctx, cancel := context.WithCancel(ctx)
-					defer func() {
-						cancel()
-						wgIn.Wait()
-						wg.Done()
-					}()
-					tuples, err := UserObjects(ctx, conn, "group", tupleKey.Subject())
-					if err != nil {
-						select {
-						case chResult <- Result[bool]{
-							Err: err,
-						}:
-						case <-ctx.Done():
-						}
-						return
-					}
-
-					for _, tuple := range tuples {
-						if ctx.Err() != nil {
-							break
-						}
-						wgIn.Add(1)
-						go func() {
-							defer wgIn.Done()
-
-							var dispatchKey Tuple
-							dispatchKey.ObjectType = tupleKey.ObjectType
-							dispatchKey.ObjectId = tupleKey.ObjectId
-							dispatchKey.Relation = tupleKey.Relation
-							dispatchKey.SubjectType = tuple.ObjectType
-							dispatchKey.SubjectId = tuple.ObjectId
-							dispatchKey.SubjectRelation = tuple.Relation
-
-							var dest string
-							err := group.Get(ctx, Key(dispatchKey, time.Now()), groupcache.StringSink(&dest))
-							if err != nil {
-								select {
-								case chIn <- Result[bool]{
-									Err: err,
-								}:
-								case <-ctx.Done():
-								}
-								return
-							}
-
-							if dest == "true" {
-								select {
-								case chIn <- Result[bool]{
-									Outcome: true,
-								}:
-								case <-ctx.Done():
-								}
-							}
-						}()
-					}
-					select {
-					case r := <-chIn:
-						chResult <- r
-					case <-ctx.Done():
-					}
+				chGroups := r.Scheduler.Schedule(ctx, func(ctx context.Context) (any, error) {
+					return UserObjects(ctx, conn, "group", tupleKey.Subject())
 				})
 
 				select {
-				case r := <-chResult:
-					return r.Outcome, r.Err
+				case r := <-chDirect:
+					if r.Err != nil {
+						return false, r.Err
+					}
+
+					if outcome, ok := r.Outcome.(bool); ok && outcome {
+						return true, nil
+					}
 				case <-ctx.Done():
+					return false, ctx.Err()
+				}
+
+				var tuples []Tuple
+
+				select {
+				case r := <-chGroups:
+					if r.Err != nil {
+						return false, r.Err
+					}
+
+					if outcome, ok := r.Outcome.([]Tuple); ok {
+						tuples = outcome
+					}
+				case <-ctx.Done():
+					return false, ctx.Err()
+				}
+
+				for _, tuple := range tuples {
+
 				}
 			}
 		}
