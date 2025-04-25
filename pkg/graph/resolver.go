@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -21,12 +22,12 @@ const QryDirect = `select object_type,
 						  subject_id,
 						  subject_relation
 					from tuples
-					where object_type = $
-					and object_id = $
-					and relation = $
-					and subject_type = $
-					and subject_id = $
-					and subject_relation = $;`
+					where object_type = $1
+					and object_id = $2
+					and relation = $3
+					and subject_type = $4
+					and subject_id = $5
+					and subject_relation = $6`
 
 const QryUserObjects = `select object_type,
 							   object_id,
@@ -35,11 +36,11 @@ const QryUserObjects = `select object_type,
 							   subject_id,
 							   subject_relation
 						from tuples
-						where object_type = $
-						and relation = $
-						and subject_type = $
-						and subject_id = $
-						and subject_relation = $;`
+						where object_type = $1
+						and relation = $2
+						and subject_type = $3
+						and subject_id = $4
+						and subject_relation = $5`
 
 type Tuple struct {
 	ObjectType      string
@@ -137,11 +138,12 @@ func Direct(ctx context.Context, conn *pgxpool.Conn, tu Tuple) (bool, error) {
 	return false, nil
 }
 
-func UserObjects(ctx context.Context, conn *pgxpool.Conn, obj string, sub TuplePart) ([]Tuple, error) {
+func UserObjects(ctx context.Context, conn *pgxpool.Conn, obj string, rel string, sub TuplePart) ([]Tuple, error) {
 	rows, err := conn.Query(
 		ctx,
 		QryUserObjects,
 		obj,
+		rel,
 		sub.Type,
 		sub.Id,
 		sub.Relation,
@@ -165,25 +167,15 @@ func UserObjects(ctx context.Context, conn *pgxpool.Conn, obj string, sub TupleP
 func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
+	println("resolving..... " + key)
+
 	defer func() {
 		cancel()
 	}()
 
-	chResult := make(chan Result, 1)
-
 	splits := strings.Split(key, "|")
 
 	tupleKey, err := ParseTuple(splits[0])
-	if err != nil {
-		return false, err
-	}
-
-	group := groupcache.GetGroup("xyz")
-	if group == nil {
-		return false, errors.New("no group")
-	}
-
-	conn, err := r.ConnectionPool.Acquire(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -193,14 +185,23 @@ func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 		switch tupleKey.SubjectType {
 		case "user":
 			if tupleKey.Relation == "viewer" {
-				ctx, cancel := context.WithCancel(ctx)
-
+				println("resolving viewer")
 				chDirect := r.Scheduler.Schedule(ctx, func(ctx context.Context) (any, error) {
+					conn, err := r.ConnectionPool.Acquire(ctx)
+					if err != nil {
+						return false, err
+					}
+					defer conn.Conn().Close(ctx)
 					return Direct(ctx, conn, tupleKey)
 				})
 
 				chGroups := r.Scheduler.Schedule(ctx, func(ctx context.Context) (any, error) {
-					return UserObjects(ctx, conn, "group", tupleKey.Subject())
+					conn, err := r.ConnectionPool.Acquire(ctx)
+					if err != nil {
+						return nil, err
+					}
+					defer conn.Conn().Close(ctx)
+					return UserObjects(ctx, conn, "group", "member", tupleKey.Subject())
 				})
 
 				select {
@@ -215,6 +216,7 @@ func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 				case <-ctx.Done():
 					return false, ctx.Err()
 				}
+				println("direct...")
 
 				var tuples []Tuple
 
@@ -230,9 +232,44 @@ func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 				case <-ctx.Done():
 					return false, ctx.Err()
 				}
+				println("userset...")
 
-				for _, tuple := range tuples {
+				results := make([]<-chan Result, len(tuples))
 
+				for i, tuple := range tuples {
+					results[i] = r.Scheduler.Schedule(ctx, func(ctx context.Context) (any, error) {
+						var answer string
+						err := r.Group.Get(ctx, Key(tuple, time.Now()), groupcache.StringSink(&answer))
+						return answer == "true", err
+					})
+				}
+
+				for {
+					println("looping...")
+					if len(results) == 0 {
+						return false, nil
+					}
+
+					var remove []int
+
+					for i := 0; i < len(results); i++ {
+						select {
+						case r := <-results[i]:
+							if v, ok := r.Outcome.(bool); v && ok {
+								cancel()
+								return true, nil
+							} else if r.Err != nil {
+								return false, err
+							} else {
+								remove = append(remove, i)
+							}
+						default:
+						}
+					}
+
+					for _, i := range remove {
+						results = slices.Delete(results, i, i)
+					}
 				}
 			}
 		}

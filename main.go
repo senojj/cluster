@@ -259,14 +259,14 @@ func main() {
 
 	pool.Set(friends.List()...)
 
-	cpool, err := pgxpool.New(context.Background(), "posgres://127.0.0.1:5432/postgres")
+	cpool, err := pgxpool.New(context.Background(), "postgres://127.0.0.1:5432/postgres")
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	group := groupcache.NewGroup("xyz", 64<<20, groupcache.GetterFunc(
 		func(ctx context.Context, key string, dest groupcache.Sink) error {
-			scheduler := graph.NewScheduler(ctx, 5)
+			scheduler := graph.NewScheduler(5)
 			group := groupcache.GetGroup("xyz")
 			if group == nil {
 				return errors.New("no such group")
@@ -297,22 +297,32 @@ func main() {
 
 	go http.ListenAndServe(srv, nil)
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 loop:
 	for {
 		select {
 		case <-ch:
 			break loop
 		case <-time.After(5 * time.Second):
-			t := time.Now().Unix() / 10
-			s := strconv.FormatInt(t, 10)
-			var value string
-			e := group.Get(context.Background(), "test"+"|"+s, groupcache.StringSink(&value))
-			if e != nil {
-				log.Println(e)
+			println("iterating...")
+			t := graph.Tuple{
+				ObjectType:  "document",
+				ObjectId:    "1",
+				Relation:    "viewer",
+				SubjectType: "user",
+				SubjectId:   "id",
 			}
-			println(value)
+
+			var result string
+			err := group.Get(ctx, graph.Key(t, time.Now()), groupcache.StringSink(&result))
+			if err != nil {
+				log.Fatal(err)
+			}
+			println(result)
 		}
 	}
+	cancel()
 	list.Shutdown()
 	close(chEvent)
 }

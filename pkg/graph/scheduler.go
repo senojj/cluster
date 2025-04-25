@@ -42,7 +42,7 @@ func (s *Scheduler) Schedule(ctx context.Context, fn TaskFunc) <-chan Result {
 	}
 
 	select {
-	case <-s.limit:
+	case s.limit <- struct{}{}:
 	case <-ctx.Done():
 		ch <- Result{
 			Err: ctx.Err(),
@@ -59,7 +59,7 @@ func (s *Scheduler) Schedule(ctx context.Context, fn TaskFunc) <-chan Result {
 				}
 			}
 			s.wg.Done()
-			s.limit <- struct{}{}
+			<-s.limit
 		}()
 		r, err := fn(ctx)
 		ch <- Result{
