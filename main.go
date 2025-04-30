@@ -4,6 +4,7 @@ import (
 	"cluster/pkg/graph"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -305,20 +306,21 @@ loop:
 		case <-ch:
 			break loop
 		case <-time.After(5 * time.Second):
-			println("iterating...")
 			t := graph.Tuple{
 				ObjectType:  "document",
 				ObjectId:    "1",
 				Relation:    "viewer",
 				SubjectType: "user",
-				SubjectId:   "id",
+				SubjectId:   "1",
 			}
 
+			start := time.Now()
 			var result string
 			err := group.Get(ctx, graph.Key(t, time.Now()), groupcache.StringSink(&result))
 			if err != nil {
 				log.Fatal(err)
 			}
+			fmt.Printf("took... %dms\n", time.Since(start).Milliseconds())
 			println(result)
 		}
 	}

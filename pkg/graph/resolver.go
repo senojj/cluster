@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"slices"
 
 	"github.com/golang/groupcache"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -40,6 +41,19 @@ const QryUserObjects = `select object_type,
 						and relation = $2
 						and subject_type = $3
 						and subject_id = $4
+						and subject_relation = $5`
+
+const QryObjectUsers = `select object_type,
+							   object_id,
+							   relation,
+							   subject_type,
+							   subject_id,
+							   subject_relation
+						from tuples
+						where object_type = $1
+						and object_id = $2
+						and relation = $3
+						and subject_type = $4
 						and subject_relation = $5`
 
 type Tuple struct {
@@ -107,7 +121,7 @@ type Resolver struct {
 	Scheduler      *Scheduler
 }
 
-func Direct(ctx context.Context, conn *pgxpool.Conn, tu Tuple) (bool, error) {
+func Direct(ctx context.Context, conn *pgxpool.Conn, tu *Tuple) ([]Tuple, error) {
 	rows, err := conn.Query(
 		ctx,
 		QryDirect,
@@ -119,34 +133,38 @@ func Direct(ctx context.Context, conn *pgxpool.Conn, tu Tuple) (bool, error) {
 		tu.SubjectRelation,
 	)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	var tuples []Tuple
 
 	for rows.Next() {
 		var tu Tuple
-		err := rows.Scan(&tu)
+		err := rows.Scan(
+			&tu.ObjectType,
+			&tu.ObjectId,
+			&tu.Relation,
+			&tu.SubjectType,
+			&tu.SubjectId,
+			&tu.SubjectRelation,
+		)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		tuples = append(tuples, tu)
 	}
 
-	if len(tuples) > 0 {
-		return true, nil
-	}
-	return false, nil
+	return tuples, nil
 }
 
-func UserObjects(ctx context.Context, conn *pgxpool.Conn, obj string, rel string, sub TuplePart) ([]Tuple, error) {
+func UserObjects(ctx context.Context, conn *pgxpool.Conn, tu *Tuple) ([]Tuple, error) {
 	rows, err := conn.Query(
 		ctx,
 		QryUserObjects,
-		obj,
-		rel,
-		sub.Type,
-		sub.Id,
-		sub.Relation,
+		tu.ObjectType,
+		tu.Relation,
+		tu.SubjectType,
+		tu.SubjectId,
+		tu.SubjectRelation,
 	)
 	if err != nil {
 		return nil, err
@@ -155,19 +173,59 @@ func UserObjects(ctx context.Context, conn *pgxpool.Conn, obj string, rel string
 
 	for rows.Next() {
 		var tu Tuple
-		err := rows.Scan(&tu)
+		err := rows.Scan(
+			&tu.ObjectType,
+			&tu.ObjectId,
+			&tu.Relation,
+			&tu.SubjectType,
+			&tu.SubjectId,
+			&tu.SubjectRelation,
+		)
 		if err != nil {
 			return nil, err
 		}
 		tuples = append(tuples, tu)
 	}
+
+	return tuples, nil
+}
+
+func ObjectUsers(ctx context.Context, conn *pgxpool.Conn, tu *Tuple) ([]Tuple, error) {
+	rows, err := conn.Query(
+		ctx,
+		QryObjectUsers,
+		tu.ObjectType,
+		tu.ObjectId,
+		tu.Relation,
+		tu.SubjectType,
+		tu.SubjectRelation,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var tuples []Tuple
+
+	for rows.Next() {
+		var tu Tuple
+		err := rows.Scan(
+			&tu.ObjectType,
+			&tu.ObjectId,
+			&tu.Relation,
+			&tu.SubjectType,
+			&tu.SubjectId,
+			&tu.SubjectRelation,
+		)
+		if err != nil {
+			return nil, err
+		}
+		tuples = append(tuples, tu)
+	}
+
 	return tuples, nil
 }
 
 func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 	ctx, cancel := context.WithCancel(ctx)
-
-	println("resolving..... " + key)
 
 	defer func() {
 		cancel()
@@ -183,16 +241,123 @@ func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 	switch tupleKey.ObjectType {
 	case "document":
 		switch tupleKey.SubjectType {
+		case "group":
+			if tupleKey.Relation == "viewer" {
+				if tupleKey.SubjectRelation == "" {
+					chDirect := r.Scheduler.Schedule(ctx, func(ctx context.Context) (any, error) {
+						conn, err := r.ConnectionPool.Acquire(ctx)
+						if err != nil {
+							return false, err
+						}
+
+						in := tupleKey
+						in.SubjectRelation = "member"
+						defer conn.Release()
+						return Direct(ctx, conn, &in)
+					})
+
+					chParents := r.Scheduler.Schedule(ctx, func(ctx context.Context) (any, error) {
+						conn, err := r.ConnectionPool.Acquire(ctx)
+						if err != nil {
+							return nil, err
+						}
+
+						in := Tuple{
+							ObjectType:  "group",
+							Relation:    "parent",
+							SubjectType: tupleKey.SubjectType,
+							SubjectId:   tupleKey.SubjectId,
+						}
+						defer conn.Release()
+						return UserObjects(ctx, conn, &in)
+					})
+
+					select {
+					case r := <-chDirect:
+						if r.Err != nil {
+							return false, r.Err
+						}
+
+						if outcome, ok := r.Outcome.([]Tuple); ok && len(outcome) > 0 {
+							return true, nil
+						}
+					case <-ctx.Done():
+						return false, ctx.Err()
+					}
+
+					var tuples []Tuple
+
+					select {
+					case r := <-chParents:
+						if r.Err != nil {
+							return false, r.Err
+						}
+
+						if outcome, ok := r.Outcome.([]Tuple); ok {
+							tuples = outcome
+						}
+					case <-ctx.Done():
+						return false, ctx.Err()
+					}
+
+					results := make([]<-chan Result, len(tuples))
+
+					for i, tuple := range tuples {
+						results[i] = r.Scheduler.Schedule(ctx, func(ctx context.Context) (any, error) {
+							var answer string
+							in := Tuple{
+								ObjectType:  tupleKey.ObjectType,
+								ObjectId:    tupleKey.ObjectId,
+								Relation:    tupleKey.Relation,
+								SubjectType: tuple.ObjectType,
+								SubjectId:   tuple.ObjectId,
+							}
+							err := r.Group.Get(ctx, Key(in, time.Now()), groupcache.StringSink(&answer))
+							return answer == "true", err
+						})
+					}
+
+					for {
+						if ctx.Err() != nil {
+							return false, nil
+						}
+
+						if len(results) == 0 {
+							return false, nil
+						}
+
+						var remove []int
+
+						for i := 0; i < len(results); i++ {
+							select {
+							case r := <-results[i]:
+								if v, ok := r.Outcome.(bool); v && ok {
+									cancel()
+									return true, nil
+								} else if r.Err != nil {
+									return false, err
+								} else {
+									remove = append(remove, i)
+								}
+							default:
+							}
+						}
+
+						for _, i := range remove {
+							results = slices.Delete(results, i, i+1)
+						}
+					}
+				}
+			}
 		case "user":
 			if tupleKey.Relation == "viewer" {
-				println("resolving viewer")
 				chDirect := r.Scheduler.Schedule(ctx, func(ctx context.Context) (any, error) {
 					conn, err := r.ConnectionPool.Acquire(ctx)
 					if err != nil {
 						return false, err
 					}
-					defer conn.Conn().Close(ctx)
-					return Direct(ctx, conn, tupleKey)
+					defer conn.Release()
+					return Direct(ctx, conn, &tupleKey)
 				})
 
 				chGroups := r.Scheduler.Schedule(ctx, func(ctx context.Context) (any, error) {
@@ -200,8 +365,16 @@ func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 					if err != nil {
 						return nil, err
 					}
-					defer conn.Conn().Close(ctx)
-					return UserObjects(ctx, conn, "group", "member", tupleKey.Subject())
+
+					in := Tuple{
+						ObjectType:      "group",
+						Relation:        "member",
+						SubjectType:     tupleKey.SubjectType,
+						SubjectId:       tupleKey.SubjectId,
+						SubjectRelation: tupleKey.SubjectRelation,
+					}
+					defer conn.Release()
+					return UserObjects(ctx, conn, &in)
 				})
 
 				select {
@@ -210,13 +383,12 @@ func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 						return false, r.Err
 					}
 
-					if outcome, ok := r.Outcome.(bool); ok && outcome {
+					if outcome, ok := r.Outcome.([]Tuple); ok && len(outcome) > 0 {
 						return true, nil
 					}
 				case <-ctx.Done():
 					return false, ctx.Err()
 				}
-				println("direct...")
 
 				var tuples []Tuple
 
@@ -232,20 +404,29 @@ func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 				case <-ctx.Done():
 					return false, ctx.Err()
 				}
-				println("userset...")
 
 				results := make([]<-chan Result, len(tuples))
 
 				for i, tuple := range tuples {
 					results[i] = r.Scheduler.Schedule(ctx, func(ctx context.Context) (any, error) {
 						var answer string
-						err := r.Group.Get(ctx, Key(tuple, time.Now()), groupcache.StringSink(&answer))
+						in := Tuple{
+							ObjectType:  tupleKey.ObjectType,
+							ObjectId:    tupleKey.ObjectId,
+							Relation:    tupleKey.Relation,
+							SubjectType: tuple.ObjectType,
+							SubjectId:   tuple.ObjectId,
+						}
+						err := r.Group.Get(ctx, Key(in, time.Now()), groupcache.StringSink(&answer))
 						return answer == "true", err
 					})
 				}
 
 				for {
-					println("looping...")
+					if ctx.Err() != nil {
+						return false, nil
+					}
+
 					if len(results) == 0 {
 						return false, nil
 					}
@@ -268,7 +449,7 @@ func (r *Resolver) Resolve(ctx context.Context, key string) (bool, error) {
 					}
 
 					for _, i := range remove {
-						results = slices.Delete(results, i, i)
+						results = slices.Delete(results, i, i+1)
 					}
 				}
 			}
